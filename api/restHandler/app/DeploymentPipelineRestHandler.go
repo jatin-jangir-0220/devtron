@@ -8,12 +8,14 @@ import (
 	bean2 "github.com/devtron-labs/devtron/api/bean"
 	"github.com/devtron-labs/devtron/api/restHandler/common"
 	"github.com/devtron-labs/devtron/internal/sql/repository/helper"
+	"github.com/devtron-labs/devtron/internal/sql/repository/pipelineConfig"
 	"github.com/devtron-labs/devtron/internal/sql/repository/security"
 	"github.com/devtron-labs/devtron/internal/util"
 	appGroup2 "github.com/devtron-labs/devtron/pkg/appGroup"
 	"github.com/devtron-labs/devtron/pkg/bean"
 	"github.com/devtron-labs/devtron/pkg/chart"
 	"github.com/devtron-labs/devtron/pkg/pipeline"
+	bean3 "github.com/devtron-labs/devtron/pkg/pipeline/bean"
 	"github.com/devtron-labs/devtron/pkg/user/casbin"
 	"github.com/go-pg/pg"
 	"github.com/gorilla/mux"
@@ -24,6 +26,12 @@ import (
 	"strings"
 )
 
+type DeploymentHistoryResp struct {
+	CdWorkflows                []pipelineConfig.CdWorkflowWithArtifact `json:"cdWorkflows"`
+	TagsEdiatable              bool                                    `json:"tagsEditable"`
+	AppReleaseTagNames         []string                                `json:"appReleaseTagNames"` //unique list of tags exists in the app
+	HideImageTaggingHardDelete bool                                    `json:"hideImageTaggingHardDelete"`
+}
 type DevtronAppDeploymentRestHandler interface {
 	CreateCdPipeline(w http.ResponseWriter, r *http.Request)
 	GetCdPipelineById(w http.ResponseWriter, r *http.Request)
@@ -43,6 +51,8 @@ type DevtronAppDeploymentRestHandler interface {
 	FetchCdWorkflowDetails(w http.ResponseWriter, r *http.Request)
 	GetCdPipelinesByEnvironment(w http.ResponseWriter, r *http.Request)
 	GetCdPipelinesByEnvironmentMin(w http.ResponseWriter, r *http.Request)
+
+	ChangeChartRef(w http.ResponseWriter, r *http.Request)
 }
 
 type DevtronAppDeploymentConfigRestHandler interface {
@@ -490,6 +500,150 @@ func (handler PipelineConfigRestHandlerImpl) HandleTriggerDeploymentAfterTypeCha
 	return
 }
 
+func (handler PipelineConfigRestHandlerImpl) ChangeChartRef(w http.ResponseWriter, r *http.Request) {
+	userId, err := handler.userAuthService.GetLoggedInUser(r)
+	if userId == 0 || err != nil {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
+		return
+	}
+	decoder := json.NewDecoder(r.Body)
+	var request chart.ChartRefChangeRequest
+	err = decoder.Decode(&request)
+	if err != nil || request.EnvId == 0 || request.TargetChartRefId == 0 || request.AppId == 0 {
+		handler.Logger.Errorw("request err, ChangeChartRef", "err", err, "payload", request)
+		common.WriteJsonResp(w, err, request, http.StatusBadRequest)
+		return
+	}
+	envConfigProperties, err := handler.propertiesConfigService.GetLatestEnvironmentProperties(request.AppId, request.EnvId)
+	if err != nil || envConfigProperties == nil {
+		handler.Logger.Errorw("env properties not found, ChangeChartRef", "err", err, "payload", request)
+		common.WriteJsonResp(w, err, "env properties not found", http.StatusNotFound)
+		return
+	}
+	if !envConfigProperties.IsOverride {
+		handler.Logger.Errorw("isOverride is not true, ChangeChartRef", "err", err, "payload", request)
+		common.WriteJsonResp(w, err, "specific environment is not overriden", http.StatusUnprocessableEntity)
+		return
+	}
+	compatible, oldChartType, newChartType := handler.chartService.ChartRefIdsCompatible(envConfigProperties.ChartRefId, request.TargetChartRefId)
+	if !compatible {
+		common.WriteJsonResp(w, fmt.Errorf("charts not compatible"), "chart not compatible", http.StatusUnprocessableEntity)
+		return
+	}
+
+	envConfigProperties.EnvOverrideValues, err = handler.chartService.PatchEnvOverrides(envConfigProperties.EnvOverrideValues, oldChartType, newChartType)
+	if err != nil {
+		common.WriteJsonResp(w, err, "error in patching env override", http.StatusInternalServerError)
+		return
+	}
+
+	if newChartType == chart.RolloutChartType {
+		enabled, err := handler.chartService.FlaggerCanaryEnabled(envConfigProperties.EnvOverrideValues)
+		if err != nil || enabled {
+			handler.Logger.Errorw("rollout charts do not support flaggerCanary, ChangeChartRef", "err", err, "payload", request)
+			common.WriteJsonResp(w, err, "rollout charts do not support flaggerCanary, ChangeChartRef", http.StatusBadRequest)
+			return
+		}
+	}
+
+	envMetrics, err := handler.propertiesConfigService.FindEnvLevelAppMetricsByAppIdAndEnvId(request.AppId, request.EnvId)
+	if err != nil {
+		handler.Logger.Errorw("could not find envMetrics for, ChangeChartRef", "err", err, "payload", request)
+		common.WriteJsonResp(w, err, "env metric could not be fetched", http.StatusBadRequest)
+		return
+	}
+	envConfigProperties.ChartRefId = request.TargetChartRefId
+	envConfigProperties.UserId = userId
+	envConfigProperties.EnvironmentId = request.EnvId
+	envConfigProperties.AppMetrics = envMetrics.AppMetrics
+
+	token := r.Header.Get("token")
+	handler.Logger.Infow("request payload, EnvConfigOverrideCreate", "payload", request)
+	resourceName := handler.enforcerUtil.GetAppRBACNameByAppId(request.AppId)
+	if ok := handler.enforcer.Enforce(token, casbin.ResourceApplications, casbin.ActionCreate, resourceName); !ok {
+		common.WriteJsonResp(w, fmt.Errorf("unauthorized user"), "Unauthorized User", http.StatusForbidden)
+		return
+	}
+	object := handler.enforcerUtil.GetEnvRBACNameByAppId(request.AppId, request.EnvId)
+	if ok := handler.enforcer.Enforce(token, casbin.ResourceEnvironment, casbin.ActionUpdate, object); !ok {
+		common.WriteJsonResp(w, fmt.Errorf("unauthorized user"), "Unauthorized User", http.StatusForbidden)
+		return
+	}
+
+	validate, err2 := handler.chartService.DeploymentTemplateValidate(r.Context(), envConfigProperties.EnvOverrideValues, envConfigProperties.ChartRefId)
+	if !validate {
+		handler.Logger.Errorw("validation err, UpdateAppOverride", "err", err2, "payload", request)
+		common.WriteJsonResp(w, err2, "validation err, UpdateAppOverrid", http.StatusBadRequest)
+		return
+	}
+	envConfigPropertiesOld, err := handler.propertiesConfigService.FetchEnvProperties(request.AppId, request.EnvId, request.TargetChartRefId)
+	if err == nil {
+		envConfigProperties.Id = envConfigPropertiesOld.Id
+		createResp, err := handler.propertiesConfigService.UpdateEnvironmentProperties(request.AppId, envConfigProperties, userId)
+		if err != nil {
+			handler.Logger.Errorw("service err, EnvConfigOverrideUpdate", "err", err, "payload", envConfigProperties)
+			common.WriteJsonResp(w, err, createResp, http.StatusInternalServerError)
+			return
+		}
+		common.WriteJsonResp(w, err, createResp, http.StatusOK)
+		return
+	}
+	createResp, err := handler.propertiesConfigService.CreateEnvironmentProperties(request.AppId, envConfigProperties)
+
+	if err != nil {
+		if err.Error() == bean2.NOCHARTEXIST {
+			ctx, cancel := context.WithCancel(r.Context())
+			if cn, ok := w.(http.CloseNotifier); ok {
+				go func(done <-chan struct{}, closed <-chan bool) {
+					select {
+					case <-done:
+					case <-closed:
+						cancel()
+					}
+				}(ctx.Done(), cn.CloseNotify())
+			}
+			acdToken, err := handler.argoUserService.GetLatestDevtronArgoCdUserToken()
+			if err != nil {
+				handler.Logger.Errorw("error in getting acd token", "err", err)
+				common.WriteJsonResp(w, err, "error in getting acd token", http.StatusInternalServerError)
+				return
+			}
+			ctx = context.WithValue(r.Context(), "token", acdToken)
+			appMetrics := false
+			if envConfigProperties.AppMetrics != nil {
+				appMetrics = *envMetrics.AppMetrics
+			}
+			templateRequest := chart.TemplateRequest{
+				AppId:               request.AppId,
+				ChartRefId:          request.TargetChartRefId,
+				ValuesOverride:      []byte("{}"),
+				UserId:              userId,
+				IsAppMetricsEnabled: appMetrics,
+			}
+
+			_, err = handler.chartService.CreateChartFromEnvOverride(templateRequest, ctx)
+			if err != nil {
+				handler.Logger.Errorw("service err, CreateChartFromEnvOverride", "err", err, "payload", request)
+				common.WriteJsonResp(w, err, "could not create chart from env override", http.StatusInternalServerError)
+				return
+			}
+			createResp, err = handler.propertiesConfigService.CreateEnvironmentProperties(request.AppId, envConfigProperties)
+			if err != nil {
+				handler.Logger.Errorw("service err, CreateEnvironmentProperties", "err", err, "payload", request)
+				common.WriteJsonResp(w, err, "could not create env properties", http.StatusInternalServerError)
+				return
+			}
+			common.WriteJsonResp(w, err, createResp, http.StatusOK)
+			return
+		} else {
+			handler.Logger.Errorw("service err, EnvConfigOverrideCreate", "err", err, "payload", request)
+			common.WriteJsonResp(w, err, "service err, EnvConfigOverrideCreate", http.StatusInternalServerError)
+			return
+		}
+	}
+	common.WriteJsonResp(w, err, createResp, http.StatusOK)
+}
+
 func (handler PipelineConfigRestHandlerImpl) EnvConfigOverrideCreate(w http.ResponseWriter, r *http.Request) {
 	userId, err := handler.userAuthService.GetLoggedInUser(r)
 	if userId == 0 || err != nil {
@@ -497,7 +651,7 @@ func (handler PipelineConfigRestHandlerImpl) EnvConfigOverrideCreate(w http.Resp
 		return
 	}
 	decoder := json.NewDecoder(r.Body)
-	var envConfigProperties pipeline.EnvironmentProperties
+	var envConfigProperties bean3.EnvironmentProperties
 	err = decoder.Decode(&envConfigProperties)
 	if err != nil {
 		handler.Logger.Errorw("request err, EnvConfigOverrideCreate", "err", err, "payload", envConfigProperties)
@@ -599,7 +753,7 @@ func (handler PipelineConfigRestHandlerImpl) EnvConfigOverrideUpdate(w http.Resp
 		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
 		return
 	}
-	var envConfigProperties pipeline.EnvironmentProperties
+	var envConfigProperties bean3.EnvironmentProperties
 	err = decoder.Decode(&envConfigProperties)
 	envConfigProperties.UserId = userId
 	if err != nil {
@@ -941,7 +1095,9 @@ func (handler PipelineConfigRestHandlerImpl) GetArtifactsByCDPipeline(w http.Res
 		common.WriteJsonResp(w, fmt.Errorf("unauthorized user"), "Unauthorized User", http.StatusForbidden)
 		return
 	}
-
+	//rbac for edit tags access
+	triggerAccess := handler.enforcer.Enforce(token, casbin.ResourceApplications, casbin.ActionTrigger, object)
+	//rbac
 	object = handler.enforcerUtil.GetAppRBACByAppNameAndEnvId(pipeline.App.AppName, pipeline.EnvironmentId)
 	if ok := handler.enforcer.Enforce(token, casbin.ResourceEnvironment, casbin.ActionGet, object); !ok {
 		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusForbidden)
@@ -953,6 +1109,24 @@ func (handler PipelineConfigRestHandlerImpl) GetArtifactsByCDPipeline(w http.Res
 	if err != nil {
 		handler.Logger.Errorw("service err, GetArtifactsByCDPipeline", "err", err, "cdPipelineId", cdPipelineId, "stage", stage)
 		common.WriteJsonResp(w, err, nil, http.StatusInternalServerError)
+		return
+	}
+
+	appTags, err := handler.imageTaggingService.GetUniqueTagsByAppId(pipeline.AppId)
+	if err != nil {
+		handler.Logger.Errorw("service err, GetTagsByAppId", "err", err, "appId", pipeline.AppId)
+		common.WriteJsonResp(w, err, ciArtifactResponse, http.StatusInternalServerError)
+		return
+	}
+
+	ciArtifactResponse.AppReleaseTagNames = appTags
+
+	prodEnvExists, err := handler.imageTaggingService.GetProdEnvByCdPipelineId(pipeline.Id)
+	ciArtifactResponse.TagsEditable = prodEnvExists && triggerAccess
+	ciArtifactResponse.HideImageTaggingHardDelete = handler.imageTaggingService.GetImageTaggingServiceConfig().HideImageTaggingHardDelete
+	if err != nil {
+		handler.Logger.Errorw("service err, GetProdEnvByCdPipelineId", "err", err, "cdPipelineId", pipeline.Id)
+		common.WriteJsonResp(w, err, ciArtifactResponse, http.StatusInternalServerError)
 		return
 	}
 
@@ -1493,14 +1667,31 @@ func (handler *PipelineConfigRestHandlerImpl) ListDeploymentHistory(w http.Respo
 		return
 	}
 	//RBAC CHECK
-
-	resp, err := handler.cdHandler.GetCdBuildHistory(appId, environmentId, pipelineId, offset, limit)
+	resp := DeploymentHistoryResp{}
+	wfs, err := handler.cdHandler.GetCdBuildHistory(appId, environmentId, pipelineId, offset, limit)
+	resp.CdWorkflows = wfs
 	if err != nil {
 		handler.Logger.Errorw("service err, List", "err", err, "appId", appId, "environmentId", environmentId, "pipelineId", pipelineId, "offset", offset)
 		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
 		return
 	}
 
+	appTags, err := handler.imageTaggingService.GetUniqueTagsByAppId(appId)
+	if err != nil {
+		handler.Logger.Errorw("service err, GetTagsByAppId", "err", err, "appId", appId)
+		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
+		return
+	}
+	resp.AppReleaseTagNames = appTags
+
+	prodEnvExists, err := handler.imageTaggingService.GetProdEnvByCdPipelineId(pipelineId)
+	resp.TagsEdiatable = prodEnvExists
+	resp.HideImageTaggingHardDelete = handler.imageTaggingService.GetImageTaggingServiceConfig().HideImageTaggingHardDelete
+	if err != nil {
+		handler.Logger.Errorw("service err, GetProdEnvFromParentAndLinkedWorkflow", "err", err, "cdPipelineId", pipelineId)
+		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
+		return
+	}
 	common.WriteJsonResp(w, err, resp, http.StatusOK)
 }
 
@@ -1774,6 +1965,10 @@ func (handler PipelineConfigRestHandlerImpl) GetCdPipelineById(w http.ResponseWr
 		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
 		return
 	}
+	version := "v1"
+	if strings.Contains(r.URL.Path, "v2") {
+		version = "v2"
+	}
 	handler.Logger.Infow("request payload, GetCdPipelineById", "err", err, "appId", appId, "pipelineId", pipelineId)
 	app, err := handler.pipelineBuilder.GetApp(appId)
 	if err != nil {
@@ -1798,7 +1993,13 @@ func (handler PipelineConfigRestHandlerImpl) GetCdPipelineById(w http.ResponseWr
 		common.WriteJsonResp(w, err, nil, http.StatusInternalServerError)
 		return
 	}
-	common.WriteJsonResp(w, err, ciConf, http.StatusOK)
+	cdResp, err := pipeline.CreatePreAndPostStageResponse(ciConf, version)
+	if err != nil {
+		handler.Logger.Errorw("service err, CheckForVersionAndCreatePreAndPostStagePayload", "err", err, "appId", appId, "pipelineId", pipelineId)
+		common.WriteJsonResp(w, err, nil, http.StatusInternalServerError)
+		return
+	}
+	common.WriteJsonResp(w, err, cdResp, http.StatusOK)
 }
 
 func (handler PipelineConfigRestHandlerImpl) CancelStage(w http.ResponseWriter, r *http.Request) {
@@ -1924,7 +2125,7 @@ func (handler PipelineConfigRestHandlerImpl) EnvConfigOverrideCreateNamespace(w 
 		return
 	}
 	decoder := json.NewDecoder(r.Body)
-	var envConfigProperties pipeline.EnvironmentProperties
+	var envConfigProperties bean3.EnvironmentProperties
 	err = decoder.Decode(&envConfigProperties)
 	envConfigProperties.UserId = userId
 	envConfigProperties.EnvironmentId = environmentId

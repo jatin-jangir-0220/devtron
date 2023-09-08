@@ -6,6 +6,7 @@ package main
 import (
 	"github.com/devtron-labs/authenticator/middleware"
 	"github.com/devtron-labs/devtron/api/apiToken"
+	chartProvider "github.com/devtron-labs/devtron/api/appStore/chartProvider"
 	appStoreDeployment "github.com/devtron-labs/devtron/api/appStore/deployment"
 	appStoreDiscover "github.com/devtron-labs/devtron/api/appStore/discover"
 	appStoreValues "github.com/devtron-labs/devtron/api/appStore/values"
@@ -15,6 +16,7 @@ import (
 	"github.com/devtron-labs/devtron/api/dashboardEvent"
 	"github.com/devtron-labs/devtron/api/externalLink"
 	client "github.com/devtron-labs/devtron/api/helm-app"
+	"github.com/devtron-labs/devtron/api/k8s"
 	"github.com/devtron-labs/devtron/api/module"
 	"github.com/devtron-labs/devtron/api/restHandler"
 	"github.com/devtron-labs/devtron/api/router"
@@ -30,6 +32,7 @@ import (
 	"github.com/devtron-labs/devtron/internal/sql/repository"
 	app2 "github.com/devtron-labs/devtron/internal/sql/repository/app"
 	"github.com/devtron-labs/devtron/internal/sql/repository/appStatus"
+	dockerRegistryRepository "github.com/devtron-labs/devtron/internal/sql/repository/dockerRegistry"
 	"github.com/devtron-labs/devtron/internal/sql/repository/pipelineConfig"
 	security2 "github.com/devtron-labs/devtron/internal/sql/repository/security"
 	"github.com/devtron-labs/devtron/internal/util"
@@ -42,11 +45,12 @@ import (
 	delete2 "github.com/devtron-labs/devtron/pkg/delete"
 	"github.com/devtron-labs/devtron/pkg/kubernetesResourceAuditLogs"
 	repository2 "github.com/devtron-labs/devtron/pkg/kubernetesResourceAuditLogs/repository"
+	"github.com/devtron-labs/devtron/pkg/pipeline"
 	"github.com/devtron-labs/devtron/pkg/sql"
 	util2 "github.com/devtron-labs/devtron/pkg/util"
 	util3 "github.com/devtron-labs/devtron/util"
 	"github.com/devtron-labs/devtron/util/argo"
-	"github.com/devtron-labs/devtron/util/k8s"
+	util4 "github.com/devtron-labs/devtron/util/k8s"
 	"github.com/devtron-labs/devtron/util/rbac"
 	"github.com/google/wire"
 )
@@ -59,6 +63,7 @@ func InitializeApp() (*App, error) {
 		user.UserWireSet,
 		sso.SsoConfigWireSet,
 		AuthWireSet,
+		util4.NewK8sUtil,
 		externalLink.ExternalLinkWireSet,
 		team.TeamsWireSet,
 		cluster.ClusterWireSetEa,
@@ -67,6 +72,7 @@ func InitializeApp() (*App, error) {
 		k8s.K8sApplicationWireSet,
 		chartRepo.ChartRepositoryWireSet,
 		appStoreDiscover.AppStoreDiscoverWireSet,
+		chartProvider.AppStoreChartProviderWireSet,
 		appStoreValues.AppStoreValuesWireSet,
 		appStoreDeployment.AppStoreDeploymentWireSet,
 		server.ServerWireSet,
@@ -80,7 +86,6 @@ func InitializeApp() (*App, error) {
 		util3.GetGlobalEnvVariables,
 		util.NewHttpClient,
 		util.NewSugardLogger,
-		util.NewK8sUtil,
 		util.IntValidator,
 		util2.GetACDAuthConfig,
 		telemetry.NewPosthogClient,
@@ -178,6 +183,21 @@ func InitializeApp() (*App, error) {
 
 		security2.NewScanToolMetadataRepositoryImpl,
 		wire.Bind(new(security2.ScanToolMetadataRepository), new(*security2.ScanToolMetadataRepositoryImpl)),
+
+		// start: docker registry wire set injection
+		router.NewDockerRegRouterImpl,
+		wire.Bind(new(router.DockerRegRouter), new(*router.DockerRegRouterImpl)),
+		restHandler.NewDockerRegRestHandlerImpl,
+		wire.Bind(new(restHandler.DockerRegRestHandler), new(*restHandler.DockerRegRestHandlerImpl)),
+		pipeline.NewDockerRegistryConfigImpl,
+		wire.Bind(new(pipeline.DockerRegistryConfig), new(*pipeline.DockerRegistryConfigImpl)),
+		dockerRegistryRepository.NewDockerArtifactStoreRepositoryImpl,
+		wire.Bind(new(dockerRegistryRepository.DockerArtifactStoreRepository), new(*dockerRegistryRepository.DockerArtifactStoreRepositoryImpl)),
+		dockerRegistryRepository.NewDockerRegistryIpsConfigRepositoryImpl,
+		wire.Bind(new(dockerRegistryRepository.DockerRegistryIpsConfigRepository), new(*dockerRegistryRepository.DockerRegistryIpsConfigRepositoryImpl)),
+		dockerRegistryRepository.NewOCIRegistryConfigRepositoryImpl,
+		wire.Bind(new(dockerRegistryRepository.OCIRegistryConfigRepository), new(*dockerRegistryRepository.OCIRegistryConfigRepositoryImpl)),
+		// end: docker registry wire set injection
 	)
 	return &App{}, nil
 }

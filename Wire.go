@@ -25,6 +25,7 @@ import (
 	pubsub1 "github.com/devtron-labs/common-lib/pubsub-lib"
 	"github.com/devtron-labs/devtron/api/apiToken"
 	appStoreRestHandler "github.com/devtron-labs/devtron/api/appStore"
+	chartProvider "github.com/devtron-labs/devtron/api/appStore/chartProvider"
 	appStoreDeployment "github.com/devtron-labs/devtron/api/appStore/deployment"
 	appStoreDiscover "github.com/devtron-labs/devtron/api/appStore/discover"
 	appStoreValues "github.com/devtron-labs/devtron/api/appStore/values"
@@ -35,6 +36,7 @@ import (
 	"github.com/devtron-labs/devtron/api/deployment"
 	"github.com/devtron-labs/devtron/api/externalLink"
 	client "github.com/devtron-labs/devtron/api/helm-app"
+	"github.com/devtron-labs/devtron/api/k8s"
 	"github.com/devtron-labs/devtron/api/module"
 	"github.com/devtron-labs/devtron/api/restHandler"
 	pipeline2 "github.com/devtron-labs/devtron/api/restHandler/app"
@@ -46,6 +48,7 @@ import (
 	"github.com/devtron-labs/devtron/api/team"
 	"github.com/devtron-labs/devtron/api/terminal"
 	"github.com/devtron-labs/devtron/api/user"
+	util5 "github.com/devtron-labs/devtron/api/util"
 	webhookHelm "github.com/devtron-labs/devtron/api/webhook/helm"
 	"github.com/devtron-labs/devtron/client/argocdServer"
 	"github.com/devtron-labs/devtron/client/argocdServer/application"
@@ -69,6 +72,7 @@ import (
 	"github.com/devtron-labs/devtron/internal/sql/repository/chartConfig"
 	dockerRegistryRepository "github.com/devtron-labs/devtron/internal/sql/repository/dockerRegistry"
 	"github.com/devtron-labs/devtron/internal/sql/repository/helper"
+	repository8 "github.com/devtron-labs/devtron/internal/sql/repository/imageTagging"
 	"github.com/devtron-labs/devtron/internal/sql/repository/pipelineConfig"
 	security2 "github.com/devtron-labs/devtron/internal/sql/repository/security"
 	"github.com/devtron-labs/devtron/internal/util"
@@ -111,7 +115,7 @@ import (
 	util3 "github.com/devtron-labs/devtron/pkg/util"
 	util2 "github.com/devtron-labs/devtron/util"
 	"github.com/devtron-labs/devtron/util/argo"
-	"github.com/devtron-labs/devtron/util/k8s"
+	util4 "github.com/devtron-labs/devtron/util/k8s"
 	"github.com/devtron-labs/devtron/util/rbac"
 	"github.com/google/wire"
 )
@@ -125,6 +129,7 @@ func InitializeApp() (*App, error) {
 		externalLink.ExternalLinkWireSet,
 		team.TeamsWireSet,
 		AuthWireSet,
+		util4.NewK8sUtil,
 		user.UserWireSet,
 		sso.SsoConfigWireSet,
 		cluster.ClusterWireSet,
@@ -133,6 +138,7 @@ func InitializeApp() (*App, error) {
 		k8s.K8sApplicationWireSet,
 		chartRepo.ChartRepositoryWireSet,
 		appStoreDiscover.AppStoreDiscoverWireSet,
+		chartProvider.AppStoreChartProviderWireSet,
 		appStoreValues.AppStoreValuesWireSet,
 		appStoreDeployment.AppStoreDeploymentWireSet,
 		server.ServerWireSet,
@@ -210,6 +216,8 @@ func InitializeApp() (*App, error) {
 		pipeline.GetDeploymentServiceTypeConfig,
 		pipeline.NewPipelineBuilderImpl,
 		wire.Bind(new(pipeline.PipelineBuilder), new(*pipeline.PipelineBuilderImpl)),
+		util5.NewLoggingMiddlewareImpl,
+		wire.Bind(new(util5.LoggingMiddleware), new(*util5.LoggingMiddlewareImpl)),
 		pipeline2.NewPipelineRestHandlerImpl,
 		wire.Bind(new(pipeline2.PipelineConfigRestHandler), new(*pipeline2.PipelineConfigRestHandlerImpl)),
 		router.NewPipelineRouterImpl,
@@ -218,19 +226,10 @@ func InitializeApp() (*App, error) {
 		wire.Bind(new(pipeline.CiCdPipelineOrchestrator), new(*pipeline.CiCdPipelineOrchestratorImpl)),
 		pipelineConfig.NewMaterialRepositoryImpl,
 		wire.Bind(new(pipelineConfig.MaterialRepository), new(*pipelineConfig.MaterialRepositoryImpl)),
-
 		router.NewMigrateDbRouterImpl,
 		wire.Bind(new(router.MigrateDbRouter), new(*router.MigrateDbRouterImpl)),
 		restHandler.NewMigrateDbRestHandlerImpl,
 		wire.Bind(new(restHandler.MigrateDbRestHandler), new(*restHandler.MigrateDbRestHandlerImpl)),
-		pipeline.NewDockerRegistryConfigImpl,
-		wire.Bind(new(pipeline.DockerRegistryConfig), new(*pipeline.DockerRegistryConfigImpl)),
-		dockerRegistry.NewDockerRegistryIpsConfigServiceImpl,
-		wire.Bind(new(dockerRegistry.DockerRegistryIpsConfigService), new(*dockerRegistry.DockerRegistryIpsConfigServiceImpl)),
-		dockerRegistryRepository.NewDockerArtifactStoreRepositoryImpl,
-		wire.Bind(new(dockerRegistryRepository.DockerArtifactStoreRepository), new(*dockerRegistryRepository.DockerArtifactStoreRepositoryImpl)),
-		dockerRegistryRepository.NewDockerRegistryIpsConfigRepositoryImpl,
-		wire.Bind(new(dockerRegistryRepository.DockerRegistryIpsConfigRepository), new(*dockerRegistryRepository.DockerRegistryIpsConfigRepositoryImpl)),
 		util.NewChartTemplateServiceImpl,
 		wire.Bind(new(util.ChartTemplateService), new(*util.ChartTemplateServiceImpl)),
 		util.NewChartDeploymentServiceImpl,
@@ -351,8 +350,10 @@ func InitializeApp() (*App, error) {
 		//wire.Bind(new(otel.OtelTracingService), new(*otel.OtelTracingServiceImpl)),
 		NewApp,
 		//session.NewK8sClient,
-
-		util.NewK8sUtil,
+		repository8.NewImageTaggingRepositoryImpl,
+		wire.Bind(new(repository8.ImageTaggingRepository), new(*repository8.ImageTaggingRepositoryImpl)),
+		pipeline.NewImageTaggingServiceImpl,
+		wire.Bind(new(pipeline.ImageTaggingService), new(*pipeline.ImageTaggingServiceImpl)),
 		argocdServer.NewVersionServiceImpl,
 		wire.Bind(new(argocdServer.VersionService), new(*argocdServer.VersionServiceImpl)),
 
@@ -360,10 +361,6 @@ func InitializeApp() (*App, error) {
 		wire.Bind(new(router.GitProviderRouter), new(*router.GitProviderRouterImpl)),
 		restHandler.NewGitProviderRestHandlerImpl,
 		wire.Bind(new(restHandler.GitProviderRestHandler), new(*restHandler.GitProviderRestHandlerImpl)),
-		router.NewDockerRegRouterImpl,
-		wire.Bind(new(router.DockerRegRouter), new(*router.DockerRegRouterImpl)),
-		restHandler.NewDockerRegRestHandlerImpl,
-		wire.Bind(new(restHandler.DockerRegRestHandler), new(*restHandler.DockerRegRestHandlerImpl)),
 
 		router.NewNotificationRouterImpl,
 		wire.Bind(new(router.NotificationRouter), new(*router.NotificationRouterImpl)),
@@ -851,6 +848,27 @@ func InitializeApp() (*App, error) {
 		wire.Bind(new(appGroup2.AppGroupMappingRepository), new(*appGroup2.AppGroupMappingRepositoryImpl)),
 		pipeline.NewArgoWorkflowExecutorImpl,
 		wire.Bind(new(pipeline.ArgoWorkflowExecutor), new(*pipeline.ArgoWorkflowExecutorImpl)),
+		repository5.NewManifestPushConfigRepository,
+		wire.Bind(new(repository5.ManifestPushConfigRepository), new(*repository5.ManifestPushConfigRepositoryImpl)),
+		app.NewGitOpsManifestPushServiceImpl,
+		wire.Bind(new(app.GitOpsPushService), new(*app.GitOpsManifestPushServiceImpl)),
+
+		// start: docker registry wire set injection
+		router.NewDockerRegRouterImpl,
+		wire.Bind(new(router.DockerRegRouter), new(*router.DockerRegRouterImpl)),
+		restHandler.NewDockerRegRestHandlerExtendedImpl,
+		wire.Bind(new(restHandler.DockerRegRestHandler), new(*restHandler.DockerRegRestHandlerExtendedImpl)),
+		pipeline.NewDockerRegistryConfigImpl,
+		wire.Bind(new(pipeline.DockerRegistryConfig), new(*pipeline.DockerRegistryConfigImpl)),
+		dockerRegistry.NewDockerRegistryIpsConfigServiceImpl,
+		wire.Bind(new(dockerRegistry.DockerRegistryIpsConfigService), new(*dockerRegistry.DockerRegistryIpsConfigServiceImpl)),
+		dockerRegistryRepository.NewDockerArtifactStoreRepositoryImpl,
+		wire.Bind(new(dockerRegistryRepository.DockerArtifactStoreRepository), new(*dockerRegistryRepository.DockerArtifactStoreRepositoryImpl)),
+		dockerRegistryRepository.NewDockerRegistryIpsConfigRepositoryImpl,
+		wire.Bind(new(dockerRegistryRepository.DockerRegistryIpsConfigRepository), new(*dockerRegistryRepository.DockerRegistryIpsConfigRepositoryImpl)),
+		dockerRegistryRepository.NewOCIRegistryConfigRepositoryImpl,
+		wire.Bind(new(dockerRegistryRepository.OCIRegistryConfigRepository), new(*dockerRegistryRepository.OCIRegistryConfigRepositoryImpl)),
+		// end: docker registry wire set injection
 	)
 	return &App{}, nil
 }

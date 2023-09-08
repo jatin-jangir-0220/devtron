@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	repository2 "github.com/devtron-labs/devtron/internal/sql/repository/dockerRegistry"
+	"github.com/devtron-labs/devtron/util/k8s"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -14,7 +16,6 @@ import (
 	"github.com/devtron-labs/devtron/api/connector"
 	openapi "github.com/devtron-labs/devtron/api/helm-app/openapiClient"
 	openapi2 "github.com/devtron-labs/devtron/api/openapi/openapiClient"
-	"github.com/devtron-labs/devtron/client/k8s/application"
 	"github.com/devtron-labs/devtron/internal/middleware"
 	"github.com/devtron-labs/devtron/internal/sql/repository/app"
 	"github.com/devtron-labs/devtron/internal/sql/repository/pipelineConfig"
@@ -61,6 +62,7 @@ type HelmAppService interface {
 	UpdateApplicationWithChartInfoWithExtraValues(ctx context.Context, appIdentifier *AppIdentifier, chartRepository *ChartRepository, extraValues map[string]interface{}, extraValuesYamlUrl string, useLatestChartVersion bool) (*openapi.UpdateReleaseResponse, error)
 	TemplateChart(ctx context.Context, templateChartRequest *openapi2.TemplateChartRequest) (*openapi2.TemplateChartResponse, error)
 	GetNotes(ctx context.Context, request *InstallReleaseRequest) (string, error)
+	ValidateOCIRegistry(ctx context.Context, OCIRegistryRequest *RegistryCredential) bool
 	GetRevisionHistoryMaxValue(appType SourceAppType) int32
 }
 
@@ -78,7 +80,7 @@ type HelmAppServiceImpl struct {
 	installedAppRepository               repository.InstalledAppRepository
 	appRepository                        app.AppRepository
 	clusterRepository                    clusterRepository.ClusterRepository
-	K8sUtil                              *util.K8sUtil
+	K8sUtil                              *k8s.K8sUtil
 	helmReleaseConfig                    *HelmReleaseConfig
 }
 
@@ -88,7 +90,7 @@ func NewHelmAppServiceImpl(Logger *zap.SugaredLogger, clusterService cluster.Clu
 	appStoreApplicationVersionRepository appStoreDiscoverRepository.AppStoreApplicationVersionRepository,
 	environmentService cluster.EnvironmentService, pipelineRepository pipelineConfig.PipelineRepository,
 	installedAppRepository repository.InstalledAppRepository, appRepository app.AppRepository,
-	clusterRepository clusterRepository.ClusterRepository, K8sUtil *util.K8sUtil,
+	clusterRepository clusterRepository.ClusterRepository, K8sUtil *k8s.K8sUtil,
 	helmReleaseConfig *HelmReleaseConfig) *HelmAppServiceImpl {
 	return &HelmAppServiceImpl{
 		logger:                               Logger,
@@ -121,11 +123,6 @@ func GetHelmReleaseConfig() (*HelmReleaseConfig, error) {
 	return cfg, err
 }
 
-type ResourceRequestBean struct {
-	AppId      string                     `json:"appId"`
-	K8sRequest application.K8sRequestBean `json:"k8sRequest"`
-}
-
 func (impl *HelmAppServiceImpl) listApplications(ctx context.Context, clusterIds []int) (ApplicationService_ListApplicationsClient, error) {
 	if len(clusterIds) == 0 {
 		return nil, nil
@@ -141,7 +138,7 @@ func (impl *HelmAppServiceImpl) listApplications(ctx context.Context, clusterIds
 	for _, clusterDetail := range clusters {
 		config := &ClusterConfig{
 			ApiServerUrl: clusterDetail.ServerUrl,
-			Token:        clusterDetail.Config[util.BearerToken],
+			Token:        clusterDetail.Config[k8s.BearerToken],
 			ClusterId:    int32(clusterDetail.Id),
 			ClusterName:  clusterDetail.ClusterName,
 		}
@@ -266,7 +263,7 @@ func (impl *HelmAppServiceImpl) GetClusterConf(clusterId int) (*ClusterConfig, e
 	}
 	config := &ClusterConfig{
 		ApiServerUrl: cluster.ServerUrl,
-		Token:        cluster.Config[util.BearerToken],
+		Token:        cluster.Config[k8s.BearerToken],
 		ClusterId:    int32(cluster.Id),
 		ClusterName:  cluster.ClusterName,
 	}
@@ -727,21 +724,56 @@ func (impl *HelmAppServiceImpl) TemplateChart(ctx context.Context, templateChart
 		impl.logger.Errorw("exception caught in getting k8sServerVersion", "err", err)
 		return nil, err
 	}
-	installReleaseRequest := &InstallReleaseRequest{
-		ChartName:    appStoreAppVersion.Name,
-		ChartVersion: appStoreAppVersion.Version,
-		ValuesYaml:   *templateChartRequest.ValuesYaml,
-		K8SVersion:   k8sServerVersion.String(),
-		ChartRepository: &ChartRepository{
+	var IsOCIRepo bool
+	var registryCredential *RegistryCredential
+	var chartRepository *ChartRepository
+	dockerRegistryId := appStoreAppVersion.AppStore.DockerArtifactStoreId
+	if dockerRegistryId != "" {
+		ociRegistryConfigs := appStoreAppVersion.AppStore.DockerArtifactStore.OCIRegistryConfig
+		if err != nil {
+			impl.logger.Errorw("error in fetching oci registry config", "err", err)
+			return nil, err
+		}
+		var ociRegistryConfig *repository2.OCIRegistryConfig
+		for _, config := range ociRegistryConfigs {
+			if config.RepositoryAction == repository2.STORAGE_ACTION_TYPE_PULL || config.RepositoryAction == repository2.STORAGE_ACTION_TYPE_PULL_AND_PUSH {
+				ociRegistryConfig = config
+				break
+			}
+		}
+		IsOCIRepo = true
+		registryCredential = &RegistryCredential{
+			RegistryUrl:  appStoreAppVersion.AppStore.DockerArtifactStore.RegistryURL,
+			Username:     appStoreAppVersion.AppStore.DockerArtifactStore.Username,
+			Password:     appStoreAppVersion.AppStore.DockerArtifactStore.Password,
+			AwsRegion:    appStoreAppVersion.AppStore.DockerArtifactStore.AWSRegion,
+			AccessKey:    appStoreAppVersion.AppStore.DockerArtifactStore.AWSAccessKeyId,
+			SecretKey:    appStoreAppVersion.AppStore.DockerArtifactStore.AWSSecretAccessKey,
+			RegistryType: string(appStoreAppVersion.AppStore.DockerArtifactStore.RegistryType),
+			RepoName:     appStoreAppVersion.AppStore.Name,
+			IsPublic:     ociRegistryConfig.IsPublic,
+		}
+	} else {
+		chartRepository = &ChartRepository{
 			Name:     appStoreAppVersion.AppStore.ChartRepo.Name,
 			Url:      appStoreAppVersion.AppStore.ChartRepo.Url,
 			Username: appStoreAppVersion.AppStore.ChartRepo.UserName,
 			Password: appStoreAppVersion.AppStore.ChartRepo.Password,
-		},
+		}
+	}
+
+	installReleaseRequest := &InstallReleaseRequest{
+		ChartName:       appStoreAppVersion.Name,
+		ChartVersion:    appStoreAppVersion.Version,
+		ValuesYaml:      *templateChartRequest.ValuesYaml,
+		K8SVersion:      k8sServerVersion.String(),
+		ChartRepository: chartRepository,
 		ReleaseIdentifier: &ReleaseIdentifier{
 			ReleaseNamespace: *templateChartRequest.Namespace,
 			ReleaseName:      *templateChartRequest.ReleaseName,
 		},
+		IsOCIRepo:          IsOCIRepo,
+		RegistryCredential: registryCredential,
 	}
 
 	config, err := impl.GetClusterConf(clusterId)
@@ -782,6 +814,15 @@ func (impl *HelmAppServiceImpl) GetNotes(ctx context.Context, request *InstallRe
 	}
 	notesTxt = response.Notes
 	return notesTxt, err
+}
+
+func (impl *HelmAppServiceImpl) ValidateOCIRegistry(ctx context.Context, OCIRegistryRequest *RegistryCredential) bool {
+	response, err := impl.helmAppClient.ValidateOCIRegistry(ctx, OCIRegistryRequest)
+	if err != nil {
+		impl.logger.Errorw("error in fetching chart", "err", err)
+		return false
+	}
+	return response.IsLoggedIn
 }
 
 type AppIdentifier struct {

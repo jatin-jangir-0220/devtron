@@ -9,12 +9,16 @@ import (
 	"github.com/devtron-labs/devtron/api/restHandler/common"
 	"github.com/devtron-labs/devtron/client/gitSensor"
 	"github.com/devtron-labs/devtron/internal/sql/repository"
+	dockerRegistryRepository "github.com/devtron-labs/devtron/internal/sql/repository/dockerRegistry"
 	"github.com/devtron-labs/devtron/internal/sql/repository/helper"
+	"github.com/devtron-labs/devtron/internal/sql/repository/pipelineConfig"
 	"github.com/devtron-labs/devtron/internal/util"
 	appGroup2 "github.com/devtron-labs/devtron/pkg/appGroup"
 	"github.com/devtron-labs/devtron/pkg/bean"
+	"github.com/devtron-labs/devtron/pkg/pipeline"
 	bean1 "github.com/devtron-labs/devtron/pkg/pipeline/bean"
 	"github.com/devtron-labs/devtron/pkg/user/casbin"
+	"github.com/go-pg/pg"
 	"github.com/gorilla/mux"
 	"go.opentelemetry.io/otel"
 	"io"
@@ -25,6 +29,12 @@ import (
 
 const GIT_MATERIAL_DELETE_SUCCESS_RESP = "Git material deleted successfully."
 
+type BuildHistoryResponse struct {
+	HideImageTaggingHardDelete bool                        `json:"hideImageTaggingHardDelete"`
+	TagsEditable               bool                        `json:"tagsEditable"`
+	AppReleaseTagNames         []string                    `json:"appReleaseTagNames"` //unique list of tags exists in the app
+	CiWorkflows                []pipeline.WorkflowResponse `json:"ciWorkflows"`
+}
 type DevtronAppBuildRestHandler interface {
 	CreateCiConfig(w http.ResponseWriter, r *http.Request)
 	UpdateCiTemplate(w http.ResponseWriter, r *http.Request)
@@ -33,6 +43,7 @@ type DevtronAppBuildRestHandler interface {
 	GetExternalCi(w http.ResponseWriter, r *http.Request)
 	GetExternalCiById(w http.ResponseWriter, r *http.Request)
 	PatchCiPipelines(w http.ResponseWriter, r *http.Request)
+	PatchCiMaterialSourceWithAppIdAndEnvironmentId(w http.ResponseWriter, r *http.Request)
 	TriggerCiPipeline(w http.ResponseWriter, r *http.Request)
 	GetCiPipelineMin(w http.ResponseWriter, r *http.Request)
 	GetCIPipelineById(w http.ResponseWriter, r *http.Request)
@@ -66,6 +77,11 @@ type DevtronAppBuildHistoryRestHandler interface {
 	DownloadCiWorkflowArtifacts(w http.ResponseWriter, r *http.Request)
 }
 
+type ImageTaggingRestHandler interface {
+	CreateUpdateImageTagging(w http.ResponseWriter, r *http.Request)
+	GetImageTaggingData(w http.ResponseWriter, r *http.Request)
+}
+
 func (handler PipelineConfigRestHandlerImpl) CreateCiConfig(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	userId, err := handler.userAuthService.GetLoggedInUser(r)
@@ -84,6 +100,14 @@ func (handler PipelineConfigRestHandlerImpl) CreateCiConfig(w http.ResponseWrite
 	handler.Logger.Infow("request payload, create ci config", "create request", createRequest)
 	err = handler.validator.Struct(createRequest)
 	if err != nil {
+		handler.Logger.Errorw("validation err, create ci config", "err", err, "create request", createRequest)
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+	// validates if the dockerRegistry can store CONTAINER
+	isValid := handler.dockerRegistryConfig.ValidateRegistryStorageType(createRequest.DockerRegistry, dockerRegistryRepository.OCI_REGISRTY_REPO_TYPE_CONTAINER, dockerRegistryRepository.STORAGE_ACTION_TYPE_PUSH, dockerRegistryRepository.STORAGE_ACTION_TYPE_PULL_AND_PUSH)
+	if !isValid {
+		err = fmt.Errorf("invalid registry type")
 		handler.Logger.Errorw("validation err, create ci config", "err", err, "create request", createRequest)
 		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
 		return
@@ -207,6 +231,79 @@ func (handler PipelineConfigRestHandlerImpl) UpdateBranchCiPipelinesWithRegex(w 
 	common.WriteJsonResp(w, err, resp, http.StatusOK)
 }
 
+func (handler PipelineConfigRestHandlerImpl) parseSourceChangeRequest(w http.ResponseWriter, r *http.Request) (*bean.CiMaterialPatchRequest, int32, error) {
+	decoder := json.NewDecoder(r.Body)
+	userId, err := handler.userAuthService.GetLoggedInUser(r)
+	if userId == 0 || err != nil {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
+		return nil, 0, err
+	}
+	var patchRequest bean.CiMaterialPatchRequest
+	err = decoder.Decode(&patchRequest)
+
+	if err != nil {
+		handler.Logger.Errorw("request err, PatchCiPipeline", "err", err, "PatchCiPipeline", patchRequest)
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return nil, 0, err
+	}
+	return &patchRequest, userId, nil
+}
+
+func (handler PipelineConfigRestHandlerImpl) authorizeCiSourceChangeRequest(w http.ResponseWriter, patchRequest *bean.CiMaterialPatchRequest, token string) error {
+	handler.Logger.Debugw("update request ", "req", patchRequest)
+	app, err := handler.pipelineBuilder.GetApp(patchRequest.AppId)
+	if err != nil {
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return err
+	}
+	if app.AppType != helper.CustomApp {
+		err = fmt.Errorf("only custom apps supported")
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return err
+	}
+	resourceName := handler.enforcerUtil.GetAppRBACName(app.AppName)
+	if ok := handler.enforcer.Enforce(token, casbin.ResourceApplications, casbin.ActionUpdate, resourceName); !ok {
+		err = fmt.Errorf("unauthorized user")
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusForbidden)
+		return err
+	}
+	err = handler.validator.Struct(patchRequest)
+	if err != nil {
+		handler.Logger.Errorw("validation err", "err", err)
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return err
+	}
+	return nil
+}
+
+func (handler PipelineConfigRestHandlerImpl) PatchCiMaterialSourceWithAppIdAndEnvironmentId(w http.ResponseWriter, r *http.Request) {
+	patchRequest, userId, err := handler.parseSourceChangeRequest(w, r)
+	if err != nil {
+		handler.Logger.Errorw("Parse error, PatchCiMaterialSource", "err", err, "PatchCiMaterialSource", patchRequest)
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+	if !(patchRequest.Source.Type == pipelineConfig.SOURCE_TYPE_BRANCH_FIXED || patchRequest.Source.Type == pipelineConfig.SOURCE_TYPE_BRANCH_REGEX) {
+		handler.Logger.Errorw("Unsupported source type, PatchCiMaterialSource", "err", err, "PatchCiMaterialSource", patchRequest)
+		common.WriteJsonResp(w, err, "source.type not supported", http.StatusBadRequest)
+		return
+	}
+	token := r.Header.Get("token")
+	if err = handler.authorizeCiSourceChangeRequest(w, patchRequest, token); err != nil {
+		handler.Logger.Errorw("Authorization error, PatchCiMaterialSource", "err", err, "PatchCiMaterialSource", patchRequest)
+		common.WriteJsonResp(w, err, nil, http.StatusUnauthorized)
+		return
+	}
+
+	createResp, err := handler.pipelineBuilder.PatchCiMaterialSource(patchRequest, userId)
+	if err != nil {
+		handler.Logger.Errorw("service err, PatchCiPipelines", "err", err, "PatchCiPipelines", patchRequest)
+		common.WriteJsonResp(w, err, nil, http.StatusInternalServerError)
+		return
+	}
+	common.WriteJsonResp(w, err, createResp, http.StatusOK)
+}
+
 func (handler PipelineConfigRestHandlerImpl) PatchCiPipelines(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	userId, err := handler.userAuthService.GetLoggedInUser(r)
@@ -278,7 +375,9 @@ func (handler PipelineConfigRestHandlerImpl) PatchCiPipelines(w http.ResponseWri
 			return
 		}
 	}
-
+	if app.AppType == helper.Job {
+		patchRequest.IsJob = true
+	}
 	createResp, err := handler.pipelineBuilder.PatchCiPipeline(&patchRequest)
 	if err != nil {
 		handler.Logger.Errorw("service err, PatchCiPipelines", "err", err, "PatchCiPipelines", patchRequest)
@@ -442,13 +541,11 @@ func (handler PipelineConfigRestHandlerImpl) TriggerCiPipeline(w http.ResponseWr
 		cdPipelineRbacObjects[i] = envObject
 	}
 	envRbacResultMap := handler.enforcer.EnforceByEmailInBatch(userEmailId, casbin.ResourceEnvironment, casbin.ActionTrigger, cdPipelineRbacObjects)
-	i := 0
 	for _, rbacResultOk := range envRbacResultMap {
 		if !rbacResultOk {
 			common.WriteJsonResp(w, err, "Unauthorized User", http.StatusForbidden)
 			return
 		}
-		i++
 	}
 	//RBAC ENDS
 	response := make(map[string]string)
@@ -762,7 +859,7 @@ func (handler *PipelineConfigRestHandlerImpl) GetBuildHistory(w http.ResponseWri
 		common.WriteJsonResp(w, err, nil, http.StatusInternalServerError)
 		return
 	}
-	//RBAC
+	//RBAC for build history
 	token := r.Header.Get("token")
 	object := handler.enforcerUtil.GetAppRBACNameByAppId(ciPipeline.AppId)
 	if ok := handler.enforcer.Enforce(token, casbin.ResourceApplications, casbin.ActionGet, object); !ok {
@@ -770,10 +867,30 @@ func (handler *PipelineConfigRestHandlerImpl) GetBuildHistory(w http.ResponseWri
 		return
 	}
 	//RBAC
-
-	resp, err := handler.ciHandler.GetBuildHistory(pipelineId, offset, limit)
+	//RBAC for edit tag access , user should have build permission in current ci-pipeline
+	triggerAccess := handler.enforcer.Enforce(token, casbin.ResourceApplications, casbin.ActionTrigger, object)
+	//RBAC
+	resp := BuildHistoryResponse{}
+	workflowsResp, err := handler.ciHandler.GetBuildHistory(pipelineId, ciPipeline.AppId, offset, limit)
+	resp.CiWorkflows = workflowsResp
 	if err != nil {
 		handler.Logger.Errorw("service err, GetBuildHistory", "err", err, "pipelineId", pipelineId, "offset", offset)
+		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
+		return
+	}
+	appTags, err := handler.imageTaggingService.GetUniqueTagsByAppId(ciPipeline.AppId)
+	if err != nil {
+		handler.Logger.Errorw("service err, GetTagsByAppId", "err", err, "appId", ciPipeline.AppId)
+		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
+		return
+	}
+	resp.AppReleaseTagNames = appTags
+
+	prodEnvExists, err := handler.imageTaggingService.GetProdEnvFromParentAndLinkedWorkflow(ciPipeline.Id)
+	resp.TagsEditable = prodEnvExists && triggerAccess
+	resp.HideImageTaggingHardDelete = handler.imageTaggingService.GetImageTaggingServiceConfig().HideImageTaggingHardDelete
+	if err != nil {
+		handler.Logger.Errorw("service err, GetProdEnvFromParentAndLinkedWorkflow", "err", err, "ciPipelineId", ciPipeline.Id)
 		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
 		return
 	}
@@ -1582,4 +1699,195 @@ func (handler PipelineConfigRestHandlerImpl) GetExternalCiByEnvironment(w http.R
 		return
 	}
 	common.WriteJsonResp(w, err, ciConf, http.StatusOK)
+}
+
+func (handler PipelineConfigRestHandlerImpl) CreateUpdateImageTagging(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	userId, err := handler.userAuthService.GetLoggedInUser(r)
+	if userId == 0 || err != nil {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
+		return
+	}
+	user, err := handler.userAuthService.GetById(userId)
+	if userId == 0 || err != nil {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
+		return
+	}
+	isSuperAdmin, err := handler.userAuthService.IsSuperAdmin(int(user.Id))
+	if userId == 0 || err != nil {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
+		return
+	}
+
+	artifactId, err := strconv.Atoi(vars["artifactId"])
+	if err != nil {
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+
+	pipelineId, err := strconv.Atoi(vars["ciPipelineId"])
+	if err != nil {
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+
+	externalCi, ciPipelineId, appId, err := handler.extractCipipelineMetaForImageTags(artifactId)
+	if err != nil {
+		handler.Logger.Errorw("error occurred in fetching extractCipipelineMetaForImageTags by artifact Id ", "err", err, "artifactId", artifactId)
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusInternalServerError)
+		return
+	}
+	if !externalCi && (ciPipelineId != pipelineId) {
+		common.WriteJsonResp(w, errors.New("ciPipelineId and artifactId sent in the request are not related"), nil, http.StatusBadRequest)
+		return
+	}
+	decoder := json.NewDecoder(r.Body)
+	req := &pipeline.ImageTaggingRequestDTO{}
+	err = decoder.Decode(&req)
+	if err != nil {
+		handler.Logger.Errorw("request err, CreateUpdateImageTagging", "err", err, "payload", req)
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+
+	//RBAC
+	if !isSuperAdmin {
+		object := handler.enforcerUtil.GetAppRBACNameByAppId(appId)
+		if ok := handler.enforcer.EnforceByEmail(strings.ToLower(user.EmailId), casbin.ResourceApplications, casbin.ActionTrigger, object); !ok {
+			common.WriteJsonResp(w, err, "Unauthorized User", http.StatusForbidden)
+			return
+		}
+	}
+	//RBAC
+	//check prod env exists
+	prodEnvExists := false
+	if externalCi {
+		prodEnvExists, err = handler.imageTaggingService.FindProdEnvExists(true, []int{ciPipelineId})
+	} else {
+		prodEnvExists, err = handler.imageTaggingService.GetProdEnvFromParentAndLinkedWorkflow(ciPipelineId)
+	}
+	if err != nil {
+		handler.Logger.Errorw("error occurred in checking existence of prod environment ", "err", err, "ciPipelineId", ciPipelineId)
+		common.WriteJsonResp(w, err, nil, http.StatusInternalServerError)
+		return
+	}
+	//not allowed to perform edit/save if no cd exists in prod env in the app_workflow
+	if !prodEnvExists {
+		handler.Logger.Errorw("save or edit operation not possible for this artifact", "err", nil, "artifactId", artifactId, "ciPipelineId", ciPipelineId)
+		common.WriteJsonResp(w, errors.New("save or edit operation not possible for this artifact"), nil, http.StatusBadRequest)
+		return
+	}
+
+	if !isSuperAdmin && len(req.HardDeleteTags) > 0 {
+		errMsg := errors.New("user dont have permission to delete the tags")
+		handler.Logger.Errorw("request err, CreateUpdateImageTagging", "err", errMsg, "payload", req)
+		common.WriteJsonResp(w, errMsg, nil, http.StatusBadRequest)
+		return
+	}
+	//validate request
+	isValidRequest, err := handler.imageTaggingService.ValidateImageTaggingRequest(req, appId, artifactId)
+	if err != nil || !isValidRequest {
+		handler.Logger.Errorw("request validation failed", "error", err)
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+	req.ExternalCi = externalCi
+	//pass it to service layer
+	resp, err := handler.imageTaggingService.CreateOrUpdateImageTagging(ciPipelineId, appId, artifactId, int(user.Id), req)
+	if err != nil {
+		if err.Error() == pipeline.DuplicateTagsInAppError {
+			appReleaseTags, err1 := handler.imageTaggingService.GetUniqueTagsByAppId(appId)
+			if err1 != nil {
+				handler.Logger.Errorw("error occurred in getting unique tags in app", "err", err1, "appId", appId)
+				err = err1
+			}
+			resp = &pipeline.ImageTaggingResponseDTO{}
+			resp.AppReleaseTags = appReleaseTags
+		}
+		handler.Logger.Errorw("error occurred in creating/updating image tagging data", "err", err, "ciPipelineId", ciPipelineId)
+		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
+		return
+	}
+	common.WriteJsonResp(w, err, resp, http.StatusOK)
+}
+
+func (handler PipelineConfigRestHandlerImpl) GetImageTaggingData(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	userId, err := handler.userAuthService.GetLoggedInUser(r)
+	if userId == 0 || err != nil {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
+		return
+	}
+	user, err := handler.userAuthService.GetById(userId)
+	if userId == 0 || err != nil {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusUnauthorized)
+		return
+	}
+	userEmailId := strings.ToLower(user.EmailId)
+	artifactId, err := strconv.Atoi(vars["artifactId"])
+	if err != nil {
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+	pipelineId, err := strconv.Atoi(vars["ciPipelineId"])
+	if err != nil {
+		common.WriteJsonResp(w, err, nil, http.StatusBadRequest)
+		return
+	}
+
+	externalCi, ciPipelineId, appId, err := handler.extractCipipelineMetaForImageTags(artifactId)
+	if err != nil {
+		handler.Logger.Errorw("error occurred in fetching extractCipipelineMetaForImageTags by artifact Id ", "err", err, "artifactId", artifactId)
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusInternalServerError)
+		return
+	}
+	if !externalCi && (ciPipelineId != pipelineId) {
+		common.WriteJsonResp(w, errors.New("ciPipelineId and artifactId sent in the request are not related"), nil, http.StatusBadRequest)
+		return
+	}
+	//RBAC
+	object := handler.enforcerUtil.GetAppRBACNameByAppId(appId)
+	if ok := handler.enforcer.EnforceByEmail(userEmailId, casbin.ResourceApplications, casbin.ActionTrigger, object); !ok {
+		common.WriteJsonResp(w, err, "Unauthorized User", http.StatusForbidden)
+		return
+	}
+	//RBAC
+
+	resp, err := handler.imageTaggingService.GetTagsData(ciPipelineId, appId, artifactId, externalCi)
+	if err != nil {
+		handler.Logger.Errorw("error occurred in fetching GetTagsData for artifact ", "err", err, "artifactId", artifactId, "ciPipelineId", ciPipelineId, "externalCi", externalCi, "appId", appId)
+		common.WriteJsonResp(w, err, resp, http.StatusInternalServerError)
+		return
+	}
+
+	common.WriteJsonResp(w, err, resp, http.StatusOK)
+}
+
+func (handler PipelineConfigRestHandlerImpl) extractCipipelineMetaForImageTags(artifactId int) (externalCi bool, ciPipelineId int, appId int, err error) {
+	externalCi = false
+	ciPipelineId = 0
+	appId = 0
+
+	ciPipeline, err := handler.ciPipelineRepository.GetCiPipelineByArtifactId(artifactId)
+	var externalCiPipeline *pipelineConfig.ExternalCiPipeline
+	if err != nil {
+		if err == pg.ErrNoRows {
+			handler.Logger.Infow("no ciPipeline found by artifact Id, fetching external ci-pipeline ", "artifactId", artifactId)
+			externalCiPipeline, err = handler.ciPipelineRepository.GetExternalCiPipelineByArtifactId(artifactId)
+		}
+		if err != nil {
+			handler.Logger.Errorw("error occurred in fetching ciPipeline/externalCiPipeline by artifact Id ", "err", err, "artifactId", artifactId)
+			return externalCi, ciPipelineId, appId, err
+		}
+	}
+
+	if ciPipeline.Id != 0 {
+		ciPipelineId = ciPipeline.Id
+		appId = ciPipeline.AppId
+	} else {
+		externalCi = true
+		ciPipelineId = externalCiPipeline.Id
+		appId = externalCiPipeline.AppId
+	}
+	return externalCi, ciPipelineId, appId, nil
 }
